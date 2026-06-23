@@ -91,25 +91,37 @@ android {
             signingConfig = if (hasReleaseSigningConfig) {
                 signingConfigs.getByName("release")
             } else {
-                val allowDebugSigned = (project.findProperty("allowDebugSignedRelease") as? String) == "true"
-                if (allowDebugSigned) {
-
-                    signingConfigs.getByName("debug")
-                } else {
-                    throw GradleException(
-                        "Release build has no valid signing config. Configure signing.storeFile / " +
-                            "signing.storePassword / signing.keyAlias / signing.keyPassword in local.properties " +
-                            "before assembling a release APK for distribution. Refusing to silently sign with " +
-                            "the debug key — a debug-signed release breaks upgrades for existing users " +
-                            "('signatures do not match'). For a throwaway debug-signed build (e.g. CI smoke " +
-                            "build, never distribute it), pass -PallowDebugSignedRelease=true."
-                    )
-                }
+                signingConfigs.getByName("debug")
             }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+        }
+    }
+
+    // Guard: refuse to silently distribute a debug-signed release APK.
+    // This check runs at execution time (doFirst) so it never blocks debug or
+    // unit-test tasks during the Gradle configuration phase.
+    tasks.configureEach {
+        if ((name.startsWith("assemble") || name.startsWith("bundle")) &&
+            (name.endsWith("Release") || name.endsWith("release"))
+        ) {
+            doFirst {
+                val allowDebugSigned =
+                    (project.findProperty("allowDebugSignedRelease") as? String) == "true"
+                if (!hasReleaseSigningConfig && !allowDebugSigned) {
+                    throw GradleException(
+                        "Release build has no valid signing config. Configure signing.storeFile / " +
+                            "signing.storePassword / signing.keyAlias / signing.keyPassword in " +
+                            "local.properties before assembling a release APK for distribution. " +
+                            "Refusing to silently sign with the debug key — a debug-signed release " +
+                            "breaks upgrades for existing users ('signatures do not match'). " +
+                            "For a throwaway debug-signed build (e.g. CI smoke build, never " +
+                            "distribute it), pass -PallowDebugSignedRelease=true."
+                    )
+                }
+            }
         }
     }
 
