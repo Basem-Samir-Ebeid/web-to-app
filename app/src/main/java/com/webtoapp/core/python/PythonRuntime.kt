@@ -1,0 +1,756 @@
+package com.webtoapp.core.python
+
+import android.content.Context
+import com.webtoapp.core.i18n.PreviewHtmlSupport.escapeText
+import com.webtoapp.core.i18n.PreviewHtmlSupport.htmlLang
+import com.webtoapp.core.logging.AppLogger
+import com.webtoapp.core.port.PortManager
+import com.webtoapp.core.shell.ShellLogger
+import com.webtoapp.util.destroyGracefullyCompat
+import com.webtoapp.util.destroyForciblyCompat
+import com.webtoapp.util.isAliveCompat
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
+
+class PythonRuntime(private val context: Context) {
+
+    companion object {
+        private const val TAG = "PythonRuntime"
+        private const val MAX_HEALTH_CHECK_RETRIES = 60
+        private const val HEALTH_CHECK_INTERVAL_MS = 500L
+        private const val HEALTH_CHECK_STABILITY_DELAY_MS = 150L
+        private const val REQUIRED_HEALTHY_RESPONSES = 2
+    }
+
+    sealed class ServerState {
+        object Stopped : ServerState()
+        object Starting : ServerState()
+        object InstallingDeps : ServerState()
+        data class Running(val port: Int, val pid: Long) : ServerState()
+        data class Error(val message: String) : ServerState()
+    }
+
+    private val _serverState = MutableStateFlow<ServerState>(ServerState.Stopped)
+    val serverState: StateFlow<ServerState> = _serverState
+
+    private var pythonProcess: Process? = null
+    private var currentPort: Int = 0
+    private val pythonOutputBuffer = StringBuffer()
+    private val pythonStderrBuffer = StringBuffer()
+
+    fun getProjectsDir(): File {
+        return File(context.filesDir, "python_projects").also { it.mkdirs() }
+    }
+
+    fun getProjectDir(projectId: String): File {
+        return File(getProjectsDir(), projectId)
+    }
+
+    fun isPythonAvailable(): Boolean {
+        return PythonDependencyManager.isPythonReady(context)
+    }
+
+    suspend fun startServer(
+        projectDir: String,
+        entryFile: String = "app.py",
+        framework: String = "raw",
+        port: Int = 0,
+        envVars: Map<String, String> = emptyMap(),
+        installDeps: Boolean = true
+    ): Int = withContext(Dispatchers.IO) {
+        try {
+            if (!isPythonAvailable()) {
+                _serverState.value = ServerState.Error("Python 运行时未就绪，请先下载依赖")
+                return@withContext -1
+            }
+
+            stopServer()
+            _serverState.value = ServerState.Starting
+
+            val projDir = File(projectDir)
+            val pythonBin = PythonDependencyManager.getPythonExecutablePath(context)
+            val pythonHome = PythonDependencyManager.getPythonHome(context)
+            val muslLinker = PythonDependencyManager.getMuslLinkerPath(context)
+
+            AppLogger.i(TAG, "musl linker: ${muslLinker ?: "(unavailable - Python may not execute)"}")
+            ShellLogger.i(TAG, "musl linker: ${muslLinker ?: "(不可用)"}")
+
+            val binFile = File(pythonBin)
+            AppLogger.i(TAG, "Python binary: ${binFile.absolutePath} (${binFile.length() / 1024} KB, executable=${binFile.canExecute()})")
+            ShellLogger.i(TAG, "Python 二进制: ${binFile.absolutePath} (${binFile.length() / 1024} KB)")
+
+            if (binFile.length() < 1024 * 1024) {
+                val errMsg = "Python 二进制无效: 文件过小 (${binFile.length()} bytes)，请重新下载 Python 运行时或重新构建 APK"
+                AppLogger.e(TAG, errMsg)
+                ShellLogger.e(TAG, errMsg)
+                _serverState.value = ServerState.Error(errMsg)
+                return@withContext -1
+            }
+
+            val stdlibDir = File(pythonHome, "lib/python${PythonDependencyManager.PYTHON_VERSION}")
+            if (!stdlibDir.exists()) {
+                AppLogger.w(TAG, "PYTHONHOME stdlib directory missing: ${stdlibDir.absolutePath}")
+                ShellLogger.w(TAG, "PYTHONHOME 标准库目录不存在: ${stdlibDir.absolutePath}")
+            } else {
+                val fileCount = stdlibDir.walkTopDown().filter { it.isFile }.count()
+                AppLogger.i(TAG, "PYTHONHOME stdlib: ${stdlibDir.absolutePath} ($fileCount files)")
+            }
+
+            val versionCheck = verifyPythonBinary(pythonBin, pythonHome, muslLinker)
+            if (versionCheck == null) {
+                val errMsg = "Python 二进制无法执行: 运行 --version 失败。" +
+                    (if (muslLinker == null) "缺少 musl 动态链接器，请重新下载 Python 运行时" else "二进制可能损坏或不兼容当前设备") +
+                    "，请重新下载 Python 运行时或重新构建 APK"
+                AppLogger.e(TAG, errMsg)
+                ShellLogger.e(TAG, errMsg)
+                _serverState.value = ServerState.Error(errMsg)
+                return@withContext -1
+            }
+            AppLogger.i(TAG, "Python version check passed: $versionCheck")
+            ShellLogger.i(TAG, "Python 版本验证通过: $versionCheck")
+
+            if (installDeps && File(projDir, "requirements.txt").exists()) {
+                _serverState.value = ServerState.InstallingDeps
+                AppLogger.i(TAG, "Installing Python dependencies...")
+                ShellLogger.i(TAG, "安装 Python 依赖...")
+                val depsInstalled = PythonDependencyManager.installRequirements(context, projDir) { line ->
+                    ShellLogger.d(TAG, "[pip] $line")
+                }
+                if (!depsInstalled) {
+
+                    val sitePackages = File(projDir, ".pypackages")
+                    if (PythonDependencyManager.hasInstalledPackages(sitePackages)) {
+                        val existingPackages = sitePackages.listFiles()?.size ?: 0
+                        AppLogger.w(TAG, "pip install failed but .pypackages already carries ${existingPackages} packages; continuing startup")
+                        ShellLogger.w(TAG, "依赖安装失败，使用预打包依赖继续")
+                    } else {
+                        val errMsg = "Python 依赖安装失败。可能原因：1) 无网络连接 2) requirements.txt 中包含不兼容的包 3) Android 环境不支持该包的安装方式"
+                        AppLogger.e(TAG, errMsg)
+                        ShellLogger.e(TAG, errMsg)
+                        _serverState.value = ServerState.Error(errMsg)
+                        return@withContext -1
+                    }
+                }
+            }
+
+            val projectId = projDir.name
+            val serverPort = PortManager.allocateForPython(projectId, port)
+            if (serverPort < 0) {
+                _serverState.value = ServerState.Error("无法分配端口")
+                return@withContext -1
+            }
+            currentPort = serverPort
+
+            val entryFilePath = File(projDir, entryFile)
+            if (!entryFilePath.exists()) {
+                _serverState.value = ServerState.Error("入口文件不存在: $entryFile")
+                PortManager.release(serverPort)
+                return@withContext -1
+            }
+
+            createBootstrapScript(projDir, serverPort)
+
+            val command = buildPythonCommand(pythonBin, framework, entryFile, serverPort, muslLinker, pythonHome)
+
+            AppLogger.i(TAG, "Starting Python server: ${command.joinToString(" ")}")
+            AppLogger.i(TAG, "Working directory: $projectDir, port: $serverPort, framework: $framework")
+            ShellLogger.i(TAG, "启动 Python 服务器: ${command.joinToString(" ")}")
+
+            val processBuilder = ProcessBuilder(command)
+            processBuilder.directory(projDir)
+
+            val env = processBuilder.environment()
+            env["PYTHONHOME"] = pythonHome
+            env["HOME"] = context.filesDir.absolutePath
+            env["TMPDIR"] = context.cacheDir.absolutePath
+            env["PORT"] = serverPort.toString()
+            env["HOST"] = "127.0.0.1"
+            env["FLASK_ENV"] = "production"
+            env["DJANGO_SETTINGS_MODULE"] = detectDjangoSettings(projDir)
+
+            val sitePackages = File(projDir, ".pypackages")
+            val pythonPath = buildList {
+                add("${pythonHome}/lib/python${PythonDependencyManager.PYTHON_VERSION}")
+                add("${pythonHome}/lib/python${PythonDependencyManager.PYTHON_VERSION}/lib-dynload")
+                if (sitePackages.exists()) add(sitePackages.absolutePath)
+                add(projDir.absolutePath)
+            }.joinToString(":")
+            env["PYTHONPATH"] = pythonPath
+            env["LD_LIBRARY_PATH"] = "${pythonHome}/lib"
+
+            AppLogger.i(TAG, "=== Python server startup diagnostics ===")
+            AppLogger.i(TAG, "PYTHONHOME=$pythonHome")
+            AppLogger.i(TAG, "PYTHONPATH=$pythonPath")
+            AppLogger.i(TAG, "LD_LIBRARY_PATH=${pythonHome}/lib")
+            AppLogger.i(TAG, "musl linker=$muslLinker")
+            AppLogger.i(TAG, ".pypackages exists=${sitePackages.exists()}, top-level count=${sitePackages.listFiles()?.size ?: 0}, has files=${PythonDependencyManager.hasInstalledPackages(sitePackages)}")
+            AppLogger.i(TAG, "stdlib exists=${File(pythonHome, "lib/python${PythonDependencyManager.PYTHON_VERSION}").exists()}, file count=${File(pythonHome, "lib/python${PythonDependencyManager.PYTHON_VERSION}").walkTopDown().filter { it.isFile }.count()}")
+            AppLogger.i(TAG, "libpython so exists=${File(pythonHome, "lib/libpython3.12.so.1.0").exists()}, size=${File(pythonHome, "lib/libpython3.12.so.1.0").let { if (it.exists()) "${it.length()/1024}KB" else "N/A" }}")
+            AppLogger.i(TAG, "=========================")
+
+            env["PATH"] = "${File(pythonHome, "bin").absolutePath}:${env["PATH"] ?: "/usr/bin"}"
+
+            envVars.forEach { (k, v) -> env[k] = v }
+
+            pythonOutputBuffer.setLength(0)
+            pythonStderrBuffer.setLength(0)
+            pythonProcess = processBuilder.start()
+            attachProcessExitWatcher(pythonProcess!!, framework, serverPort)
+
+            pythonProcess?.inputStream?.let { stream ->
+                Thread {
+                    try {
+                        stream.bufferedReader().forEachLine { line ->
+                            AppLogger.d(TAG, "[Python] $line")
+                            ShellLogger.d(TAG, "[Python] $line")
+                            if (pythonOutputBuffer.length < 4096) pythonOutputBuffer.appendLine(line)
+                        }
+                    } catch (e: Exception) { AppLogger.d(TAG, "Python stdout reader ended", e) }
+                }.apply { isDaemon = true; start() }
+            }
+
+            pythonProcess?.errorStream?.let { stream ->
+                Thread {
+                    try {
+                        stream.bufferedReader().forEachLine { line ->
+                            AppLogger.w(TAG, "[Python-ERR] $line")
+                            ShellLogger.w(TAG, "[Python-ERR] $line")
+                            if (pythonStderrBuffer.length < 4096) pythonStderrBuffer.appendLine(line)
+                        }
+                    } catch (e: Exception) { AppLogger.d(TAG, "Python stderr reader ended", e) }
+                }.apply { isDaemon = true; start() }
+            }
+
+            val ready = waitForServerReady(serverPort, framework)
+            if (ready) {
+                val pid = getProcessPid(pythonProcess)
+                pythonProcess?.let { PortManager.registerProcess(serverPort, it, pid) }
+                _serverState.value = ServerState.Running(serverPort, pid)
+                AppLogger.i(TAG, "Python server started: 127.0.0.1:$serverPort (PID: $pid)")
+                ShellLogger.i(TAG, "Python 服务器已启动: 127.0.0.1:$serverPort")
+                serverPort
+            } else {
+                val stdout = pythonOutputBuffer.toString().trim().take(500)
+                val stderr = pythonStderrBuffer.toString().trim().take(500)
+                val processAlive = pythonProcess?.isAliveCompat() == true
+                val exitCode = if (!processAlive) try { pythonProcess?.exitValue() } catch (_: Exception) { null } else null
+                val detail = "processAlive=$processAlive, exitCode=$exitCode\nstdout: ${stdout.ifEmpty { "(无)" }}\nstderr: ${stderr.ifEmpty { "(无)" }}"
+                AppLogger.e(TAG, "Python server startup timed out, $detail")
+                val errorMsg = if (stderr.isNotEmpty()) {
+                    "Python 服务器启动超时\n$stderr"
+                } else if (stdout.isNotEmpty()) {
+                    "Python 服务器启动超时\n$stdout"
+                } else {
+                    "Python 服务器启动超时（无输出）"
+                }
+                stopServer()
+                _serverState.value = ServerState.Error(errorMsg)
+                -1
+            }
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Starting Python serverfailed", e)
+            ShellLogger.e(TAG, "启动 Python 服务器失败: ${e.message}")
+            _serverState.value = ServerState.Error("启动失败: ${e.message}")
+            -1
+        }
+    }
+
+    fun stopServer() {
+        try {
+            pythonProcess?.let { process ->
+                try {
+                    process.destroyGracefullyCompat(timeoutMs = 200L)
+                    if (process.isAliveCompat()) process.destroyForciblyCompat()
+                } catch (e: Exception) { AppLogger.d(TAG, "Force kill Python process failed", e) }
+                AppLogger.i(TAG, "Python server stopped")
+                ShellLogger.i(TAG, "Python 服务器已停止")
+            }
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "Python server stop raised an exception: ${e.message}")
+        } finally {
+            if (currentPort > 0) PortManager.release(currentPort)
+            pythonProcess = null
+            currentPort = 0
+            _serverState.value = ServerState.Stopped
+        }
+    }
+
+    fun isServerRunning(): Boolean {
+        return try { pythonProcess?.isAliveCompat() == true } catch (_: Exception) { false }
+    }
+
+    fun getCurrentPort(): Int = currentPort
+
+    fun getServerUrl(): String? {
+        return if (isServerRunning() && currentPort > 0) "http://127.0.0.1:$currentPort" else null
+    }
+
+    fun detectFramework(projectDir: File): String {
+        val candidates = listOf("app.py", "main.py", "wsgi.py", "application.py", "run.py")
+        for (candidate in candidates) {
+            val file = File(projectDir, candidate)
+            if (file.exists()) {
+                try {
+                    val content = file.readText()
+                    if (content.contains("from flask") || content.contains("import flask")) return "flask"
+                    if (content.contains("from fastapi") || content.contains("import fastapi")) return "fastapi"
+                    if (content.contains("from tornado") || content.contains("import tornado")) return "tornado"
+                } catch (e: Exception) { AppLogger.w(TAG, "Failed to read $candidate for framework detection", e) }
+            }
+        }
+        if (File(projectDir, "manage.py").exists()) return "django"
+        val requirements = File(projectDir, "requirements.txt")
+        if (requirements.exists()) {
+            try {
+                val content = requirements.readText().lowercase()
+                if (content.contains("flask")) return "flask"
+                if (content.contains("django")) return "django"
+                if (content.contains("fastapi")) return "fastapi"
+                if (content.contains("tornado")) return "tornado"
+            } catch (e: Exception) { AppLogger.w(TAG, "Failed to read requirements.txt", e) }
+        }
+        val pyproject = File(projectDir, "pyproject.toml")
+        if (pyproject.exists()) {
+            try {
+                val content = pyproject.readText().lowercase()
+                if (content.contains("flask")) return "flask"
+                if (content.contains("django")) return "django"
+                if (content.contains("fastapi")) return "fastapi"
+                if (content.contains("tornado")) return "tornado"
+            } catch (e: Exception) { AppLogger.w(TAG, "Failed to read pyproject.toml", e) }
+        }
+        return "raw"
+    }
+
+    fun detectEntryFile(projectDir: File, framework: String): String {
+        return when (framework) {
+            "django" -> if (File(projectDir, "manage.py").exists()) "manage.py" else "app.py"
+            "flask" -> listOf("app.py", "application.py", "wsgi.py", "run.py", "main.py")
+                .firstOrNull { File(projectDir, it).exists() } ?: "app.py"
+            "fastapi" -> listOf("main.py", "app.py", "api.py", "server.py")
+                .firstOrNull { File(projectDir, it).exists() } ?: "main.py"
+            "tornado" -> listOf("app.py", "main.py", "server.py")
+                .firstOrNull { File(projectDir, it).exists() } ?: "app.py"
+            else -> listOf("app.py", "main.py", "server.py", "index.py", "run.py")
+                .firstOrNull { File(projectDir, it).exists() } ?: "app.py"
+        }
+    }
+
+    fun createProject(projectId: String, sourceDir: File): File {
+        val projectDir = File(getProjectsDir(), projectId)
+        projectDir.mkdirs()
+        val excludeDirs = setOf("venv", ".venv", "__pycache__", ".git", "node_modules", ".idea", ".mypy_cache", ".pytest_cache", "env")
+        var copiedCount = 0
+        sourceDir.walkTopDown()
+            .filter { file -> !excludeDirs.any { excluded -> file.absolutePath.contains("/$excluded/") || file.absolutePath.endsWith("/$excluded") } }
+            .filter { it.isFile }
+            .forEach { file ->
+                val relativePath = file.relativeTo(sourceDir).path
+                val destFile = File(projectDir, relativePath)
+                destFile.parentFile?.mkdirs()
+                file.copyTo(destFile, overwrite = true)
+                copiedCount++
+            }
+        AppLogger.i(TAG, "Python project files copied to: ${projectDir.absolutePath} (total $copiedCount files)")
+        if (copiedCount == 0) {
+            AppLogger.w(TAG, "Warning: no files were copied! sourceDir=${sourceDir.absolutePath}, exists=${sourceDir.exists()}, canRead=${sourceDir.canRead()}, children=${sourceDir.listFiles()?.size ?: -1}")
+        }
+        return projectDir
+    }
+
+    fun syncProjectFromSource(projectId: String, sourceDir: File): File {
+        val projectDir = File(getProjectsDir(), projectId)
+        projectDir.mkdirs()
+        val excludeDirs = setOf("venv", ".venv", "__pycache__", ".git", "node_modules", ".idea", ".mypy_cache", ".pytest_cache", "env")
+        var copiedCount = 0
+        sourceDir.walkTopDown()
+            .filter { file -> !excludeDirs.any { excluded -> file.absolutePath.contains("/$excluded/") || file.absolutePath.endsWith("/$excluded") } }
+            .filter { it.isFile }
+            .forEach { file ->
+                val relativePath = file.relativeTo(sourceDir).path
+                val destFile = File(projectDir, relativePath)
+                destFile.parentFile?.mkdirs()
+                file.copyTo(destFile, overwrite = true)
+                copiedCount++
+            }
+        AppLogger.i(TAG, "Python project resync: ${sourceDir.absolutePath} -> ${projectDir.absolutePath} ($copiedCount files)")
+        return projectDir
+    }
+
+    fun resolveSourceProjectDir(sourceProjectPath: String?): File? {
+        val path = sourceProjectPath?.trim().orEmpty()
+        if (path.isEmpty()) return null
+        val file = File(path)
+        return file.takeIf { it.exists() && it.isDirectory }
+    }
+
+    fun createProjectFromUri(projectId: String, treeUri: android.net.Uri, context: Context): File {
+        val projectDir = File(getProjectsDir(), projectId)
+        projectDir.mkdirs()
+        val excludeDirs = setOf("venv", ".venv", "__pycache__", ".git", "node_modules", ".idea", ".mypy_cache", ".pytest_cache", "env", "__MACOSX")
+
+        val rootDoc = androidx.documentfile.provider.DocumentFile.fromTreeUri(context, treeUri)
+        if (rootDoc == null || !rootDoc.exists()) {
+            AppLogger.e(TAG, "SAF directory invalid: $treeUri")
+            return projectDir
+        }
+
+        var copiedCount = 0
+
+        fun copyDocTree(doc: androidx.documentfile.provider.DocumentFile, relativePath: String) {
+            if (doc.isDirectory) {
+                val dirName = doc.name ?: return
+                if (dirName in excludeDirs || dirName.startsWith("._")) return
+                val subPath = if (relativePath.isEmpty()) dirName else "$relativePath/$dirName"
+                doc.listFiles().forEach { child -> copyDocTree(child, subPath) }
+            } else if (doc.isFile) {
+                val fileName = doc.name ?: return
+                val destRelPath = if (relativePath.isEmpty()) fileName else "$relativePath/$fileName"
+                val destFile = File(projectDir, destRelPath)
+                destFile.parentFile?.mkdirs()
+                try {
+                    context.contentResolver.openInputStream(doc.uri)?.use { input ->
+                        destFile.outputStream().use { output ->
+                            input.copyTo(output)
+                        }
+                    }
+                    copiedCount++
+                } catch (e: Exception) {
+                    AppLogger.w(TAG, "Failed to copy file: $destRelPath - ${e.message}")
+                }
+            }
+        }
+
+        rootDoc.listFiles().forEach { child -> copyDocTree(child, "") }
+
+        AppLogger.i(TAG, "SAF project files copied to: ${projectDir.absolutePath} (total $copiedCount files)")
+        if (copiedCount == 0) {
+            AppLogger.w(TAG, "Warning: SAF copied no files! treeUri=$treeUri, rootDoc.name=${rootDoc.name}")
+        }
+        return projectDir
+    }
+
+    fun generatePreviewHtml(
+        projectDir: File,
+        framework: String,
+        entryFile: String,
+        startupError: String? = null,
+    ): String {
+        val S = com.webtoapp.core.i18n.Strings
+        val entryFileObj = File(projectDir, entryFile)
+        val sourceCode = if (entryFileObj.exists()) {
+            try { entryFileObj.readText().take(8000) } catch (_: Exception) { "# ${S.previewFileUnreadable}" }
+        } else "# ${S.previewFileNotFound.replace("%s", entryFile)}"
+        val reqFile = File(projectDir, "requirements.txt")
+        val requirements = if (reqFile.exists()) { try { reqFile.readText().trim() } catch (_: Exception) { "" } } else ""
+        val fileList = projectDir.walkTopDown().filter { it.isFile }.take(30).map { it.relativeTo(projectDir).path }.toList()
+        val frameworkLabel = framework.replaceFirstChar { it.uppercase() }
+        val escapedSource = sourceCode.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
+        val escapedReqs = requirements.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        val filesHtml = fileList.joinToString("\n") { "  <li>$it</li>" }
+        val pythonReady = isPythonAvailable()
+
+        val statusBadge = buildString {
+            append("<span class=\"badge muted\">${escapeText(S.previewNotRunningBadge)}</span>")
+            when {
+                startupError != null -> append("<span class=\"badge fail\">${escapeText(S.previewStartupFailedBadge)}</span>")
+                pythonReady -> append("<span class=\"badge ready\">${escapeText(S.previewRuntimeReadyBadge)}</span>")
+                else -> append("<span class=\"badge warn\">${escapeText(S.previewPythonNeedRuntime)}</span>")
+            }
+        }
+
+        val escapedErr = startupError?.take(1500)
+            ?.replace("&", "&amp;")?.replace("<", "&lt;")?.replace(">", "&gt;")
+        val errSection = if (escapedErr != null) {
+            """<div class="section err"><div class="section-title">⚠️ ${escapeText(S.previewServerStartFailedTitle)}</div><pre>$escapedErr</pre></div>"""
+        } else ""
+        val notRunningNote = escapeText(S.previewNotRunningNote)
+        val backendIntro = escapeText(S.previewBackendAppIntro.replace("%s", frameworkLabel))
+        val runtimeTip = escapeText(if (pythonReady) S.previewPythonTipReady else S.previewPythonTipNotReady)
+        val projectFilesTitle = "${escapeText(S.previewProjectFilesLabel)} (${fileList.size}${if (fileList.size >= 30) "+" else ""})"
+        return """<!DOCTYPE html>
+<html lang="${htmlLang()}"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>$frameworkLabel - ${escapeText(S.previewProjectSuffix)}</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,system-ui,sans-serif;background:#0d1117;color:#c9d1d9;padding:16px;line-height:1.6}.header{text-align:center;padding:24px 0;border-bottom:1px solid #30363d;margin-bottom:20px}.header h1{font-size:22px;color:#3776AB;margin-bottom:8px}.badge{display:inline-block;background:#3776AB;color:#fff;padding:4px 12px;border-radius:12px;font-size:13px;margin:4px}.badge.warn{background:#d29922}.badge.ready{background:#2ea043}.badge.fail{background:#da3633}.badge.muted{background:#6e7681}.section{background:#161b22;border:1px solid #30363d;border-radius:8px;margin-bottom:16px;overflow:hidden}.section.err{border-color:#da3633}.section.err .section-title{background:#3a1414;color:#ff7b72}.section-title{padding:12px 16px;background:#21262d;font-weight:600;font-size:14px;color:#8b949e;border-bottom:1px solid #30363d}pre{padding:16px;overflow-x:auto;font-size:13px;font-family:'SF Mono',Consolas,monospace;white-space:pre-wrap;word-break:break-all;color:#c9d1d9;max-height:400px;overflow-y:auto}ul{padding:12px 16px 12px 32px;font-size:13px}li{padding:2px 0;color:#8b949e}.note{background:#21262d;border:1px solid #30363d;border-radius:8px;padding:12px 16px;margin-bottom:16px;font-size:12px;color:#8b949e}.tip{background:#1a2332;border:1px solid #3776AB;border-radius:8px;padding:16px;margin-top:16px;font-size:13px;color:#3776AB}</style></head><body>
+<div class="header"><h1>🐍 $frameworkLabel</h1><span class="badge">$frameworkLabel</span>$statusBadge</div>
+<div class="note">$notRunningNote</div>
+$errSection
+<div class="section"><div class="section-title">📄 $entryFile</div><pre>$escapedSource</pre></div>
+${if (escapedReqs.isNotBlank()) """<div class="section"><div class="section-title">📦 requirements.txt</div><pre>$escapedReqs</pre></div>""" else ""}
+<div class="section"><div class="section-title">📁 $projectFilesTitle</div><ul>$filesHtml</ul></div>
+<div class="tip">💡 $backendIntro$runtimeTip</div>
+</body></html>"""
+    }
+
+    private fun verifyPythonBinary(pythonBin: String, pythonHome: String, muslLinker: String? = null): String? {
+        return try {
+
+            val cmd = if (muslLinker != null) {
+                listOf(muslLinker, "--library-path", "${pythonHome}/lib", pythonBin, "--version")
+            } else {
+                listOf(pythonBin, "--version")
+            }
+            AppLogger.d(TAG, "verifyPythonBinary: ${cmd.joinToString(" ")}")
+            val pb = ProcessBuilder(cmd)
+            val env = pb.environment()
+            env["PYTHONHOME"] = pythonHome
+            env["PYTHONPATH"] = "${pythonHome}/lib/python${PythonDependencyManager.PYTHON_VERSION}"
+            env["LD_LIBRARY_PATH"] = "${pythonHome}/lib"
+            env["HOME"] = context.filesDir.absolutePath
+            env["TMPDIR"] = context.cacheDir.absolutePath
+            pb.redirectErrorStream(true)
+            val process = pb.start()
+            val output = process.inputStream.bufferedReader().readText().trim()
+            val exitCode = process.waitFor()
+            AppLogger.d(TAG, "Python --version: exitCode=$exitCode, output='$output'")
+            if (exitCode == 0 && output.contains("Python", ignoreCase = true)) {
+                output
+            } else if (output.isNotEmpty()) {
+                AppLogger.e(TAG, "Python --version output is malformed: exitCode=$exitCode, output='$output'")
+                null
+            } else {
+                AppLogger.e(TAG, "Python --version produced no output, exitCode=$exitCode" +
+                    (if (muslLinker == null) " (no musl linker, binary may not be directly executable)" else ""))
+                null
+            }
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Failed to verify Python binary", e)
+            null
+        }
+    }
+
+    private fun buildPythonCommand(
+        pythonBin: String, framework: String, entryFile: String, port: Int,
+        muslLinker: String? = null, pythonHome: String? = null
+    ): List<String> {
+
+        val linkerPrefix = if (muslLinker != null && pythonHome != null) {
+            listOf(muslLinker, "--library-path", "${pythonHome}/lib")
+        } else emptyList()
+
+        val pythonArgs = when (framework) {
+            "flask" -> {
+
+                listOf(pythonBin, "_w2a_bootstrap.py", entryFile, port.toString())
+            }
+            "django" -> {
+                listOf(pythonBin, "manage.py", "runserver", "127.0.0.1:$port", "--noreload")
+            }
+            "fastapi" -> {
+                val appModule = entryFile.removeSuffix(".py")
+                listOf(pythonBin, "-m", "uvicorn", "$appModule:app", "--host", "127.0.0.1", "--port", port.toString())
+            }
+            "tornado" -> {
+                listOf(pythonBin, "_w2a_bootstrap.py", entryFile, port.toString())
+            }
+            else -> {
+                listOf(pythonBin, "_w2a_bootstrap.py", entryFile, port.toString())
+            }
+        }
+
+        return linkerPrefix + pythonArgs
+    }
+
+    private fun createBootstrapScript(projectDir: File, port: Int) {
+        val bootstrapFile = File(projectDir, "_w2a_bootstrap.py")
+        bootstrapFile.writeText("""#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# WebToApp Python Bootstrap - fixes Android runtime issues
+import os, sys
+
+# === 1. Patch importlib.metadata for --target installed packages ===
+# When packages are installed via 'pip install --target .pypackages',
+# the .dist-info directories may be missing, causing PackageNotFoundError.
+try:
+    import importlib.metadata
+    _orig_version = importlib.metadata.version
+    _orig_distribution = importlib.metadata.distribution
+
+    def _patched_version(name):
+        try:
+            return _orig_version(name)
+        except importlib.metadata.PackageNotFoundError:
+            # Try to find __version__ from the package module directly
+            try:
+                mod = __import__(name.replace('-', '_'))
+                version_value = getattr(mod, '__dict__', {}).get('__version__')
+                if isinstance(version_value, str) and version_value:
+                    return version_value
+            except (ImportError, Exception):
+                pass
+            return "0.0.0"
+
+    importlib.metadata.version = _patched_version
+except Exception:
+    pass
+
+# === 2. Fix port for Flask/Werkzeug ===
+# WebToApp allocates a dynamic port, but app.py may hardcode a different one.
+_w2a_port = int(sys.argv[2]) if len(sys.argv) > 2 else int(os.environ.get('PORT', '5000'))
+os.environ['PORT'] = str(_w2a_port)
+os.environ['FLASK_ENV'] = 'production'
+os.environ['FLASK_DEBUG'] = '0'
+
+try:
+    import flask
+    _orig_run = flask.Flask.run
+    def _patched_run(self, host=None, port=None, **kwargs):
+        try:
+            if '__w2a_health' not in self.view_functions:
+                def _w2a_health():
+                    return ('ok', 200, {'Content-Type': 'text/plain; charset=utf-8'})
+                self.add_url_rule('/__w2a_health', '__w2a_health', _w2a_health)
+        except Exception:
+            pass
+        kwargs.pop('debug', None)
+        kwargs['use_reloader'] = False
+        kwargs['use_debugger'] = False
+        _orig_run(self, host='127.0.0.1', port=_w2a_port, **kwargs)
+    flask.Flask.run = _patched_run
+except ImportError:
+    pass
+
+# === 3. Execute the actual entry file ===
+entry_file = sys.argv[1] if len(sys.argv) > 1 else 'app.py'
+sys.argv = [entry_file]  # Reset argv so the app sees clean arguments
+
+if os.path.exists(entry_file):
+    with open(entry_file) as f:
+        code = compile(f.read(), entry_file, 'exec')
+        exec(code, {'__name__': '__main__', '__file__': entry_file})
+else:
+    print(f"Error: Entry file not found: {entry_file}", file=sys.stderr)
+    sys.exit(1)
+""")
+        AppLogger.d(TAG, "Created bootstrap script: ${bootstrapFile.absolutePath}")
+    }
+
+    private fun detectDjangoSettings(projectDir: File): String {
+
+        projectDir.listFiles()?.forEach { dir ->
+            if (dir.isDirectory && File(dir, "settings.py").exists()) {
+                return "${dir.name}.settings"
+            }
+        }
+        return "config.settings"
+    }
+
+    private suspend fun waitForServerReady(port: Int, framework: String): Boolean {
+        val probePaths = when (framework.lowercase()) {
+            "flask" -> listOf("/__w2a_health", "/")
+            else -> listOf("/__w2a_health", "/__health", "/")
+        }
+        var consecutiveSuccesses = 0
+
+        repeat(MAX_HEALTH_CHECK_RETRIES) { attempt ->
+            var successfulPath: String? = null
+            var successfulCode = -1
+            for (path in probePaths) {
+                var conn: HttpURLConnection? = null
+                try {
+                    val url = URL("http://127.0.0.1:$port$path")
+                    conn = url.openConnection() as HttpURLConnection
+                    conn.connectTimeout = 1000
+                    conn.readTimeout = 2000
+                    conn.requestMethod = "GET"
+                    val code = conn.responseCode
+                    if (code in 200..499) {
+                        successfulPath = path
+                        successfulCode = code
+                        break
+                    }
+                } catch (e: Exception) {
+                    if (attempt % 5 == 0 && path == probePaths.last()) {
+                        AppLogger.d(TAG, "Health check attempt failed #${attempt + 1}: ${e.message}")
+                    }
+                } finally {
+                    try { conn?.disconnect() } catch (_: Exception) {}
+                }
+            }
+
+            if (successfulPath != null) {
+                consecutiveSuccesses++
+                AppLogger.i(
+                    TAG,
+                    "Python health check passed (attempt ${attempt + 1}, path=$successfulPath, code=$successfulCode, consecutive=$consecutiveSuccesses/$REQUIRED_HEALTHY_RESPONSES)"
+                )
+                if (consecutiveSuccesses >= REQUIRED_HEALTHY_RESPONSES) {
+                    AppLogger.i(
+                        TAG,
+                        "Python server ready (attempt ${attempt + 1}, path=$successfulPath, code=$successfulCode, consecutive=$consecutiveSuccesses)"
+                    )
+                    return true
+                }
+                delay(HEALTH_CHECK_STABILITY_DELAY_MS)
+                pythonProcess?.let { process ->
+                    if (!process.isAliveCompat()) {
+                        val exitCode = try { process.exitValue() } catch (_: Exception) { -1 }
+                        val stdout = pythonOutputBuffer.toString().trim().ifEmpty { "(no stdout)" }
+                        val stderr = pythonStderrBuffer.toString().trim().ifEmpty { "(no stderr)" }
+                        AppLogger.e(TAG, "Python process exited unexpectedly, exitCode=$exitCode\nstdout: $stdout\nstderr: $stderr")
+                        return false
+                    }
+                }
+                return@repeat
+            }
+
+            if (consecutiveSuccesses > 0) {
+                AppLogger.d(TAG, "Python health check stability reset: attempt=${attempt + 1}, previousConsecutive=$consecutiveSuccesses")
+                consecutiveSuccesses = 0
+            }
+
+            pythonProcess?.let { process ->
+                if (!process.isAliveCompat()) {
+                    val exitCode = try { process.exitValue() } catch (_: Exception) { -1 }
+                    val stdout = pythonOutputBuffer.toString().trim().ifEmpty { "(no stdout)" }
+                    val stderr = pythonStderrBuffer.toString().trim().ifEmpty { "(no stderr)" }
+                    AppLogger.e(TAG, "Python process exited unexpectedly, exitCode=$exitCode\nstdout: $stdout\nstderr: $stderr")
+                    return false
+                }
+            }
+            delay(HEALTH_CHECK_INTERVAL_MS)
+        }
+        AppLogger.e(TAG, "Python server startup timed out (${MAX_HEALTH_CHECK_RETRIES * HEALTH_CHECK_INTERVAL_MS}ms)")
+        return false
+    }
+
+    private fun attachProcessExitWatcher(process: Process, framework: String, port: Int) {
+        Thread {
+            val exitCode = try {
+                process.waitFor()
+            } catch (_: InterruptedException) {
+                return@Thread
+            }
+
+            if (pythonProcess !== process || currentPort != port) {
+                return@Thread
+            }
+
+            val stdout = pythonOutputBuffer.toString().trim().ifEmpty { "(no stdout)" }
+            val stderr = pythonStderrBuffer.toString().trim().ifEmpty { "(no stderr)" }
+            val message =
+                "Python 进程在服务启动后退出: framework=$framework, port=$port, exitCode=$exitCode\nstdout: $stdout\nstderr: $stderr"
+            AppLogger.e(TAG, message)
+            ShellLogger.e(TAG, message)
+        }.apply {
+            name = "PythonRuntime-ExitWatcher-$port"
+            isDaemon = true
+            start()
+        }
+    }
+
+    private fun getProcessPid(process: Process?): Long {
+        if (process == null) return -1
+        return try {
+            val pidField = process.javaClass.getDeclaredField("pid")
+            pidField.isAccessible = true
+            pidField.getInt(process).toLong()
+        } catch (_: Exception) { -1 }
+    }
+}

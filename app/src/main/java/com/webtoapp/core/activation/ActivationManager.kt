@@ -1,0 +1,479 @@
+package com.webtoapp.core.activation
+
+import android.content.Context
+import androidx.datastore.core.DataStore
+import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.booleanPreferencesKey
+import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.intPreferencesKey
+import androidx.datastore.preferences.core.longPreferencesKey
+import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.preferencesDataStore
+import com.webtoapp.core.logging.AppLogger
+import com.webtoapp.core.i18n.Strings
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+import java.security.MessageDigest
+import java.security.SecureRandom
+
+internal val Context.activationDataStore: DataStore<Preferences> by preferencesDataStore(name = "activation")
+
+class ActivationManager(private val context: Context) {
+
+    companion object {
+        private const val TAG = "ActivationManager"
+        private const val SALT = "WebToApp_Salt_2024"
+        private const val MAX_FAILED_ATTEMPTS = 5
+        private const val LOCKOUT_DURATION_MS = 2 * 60 * 1000L
+
+        private const val CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+        const val MIN_CODE_LENGTH = 4
+        const val MAX_CODE_LENGTH = 16
+        const val DEFAULT_CODE_LENGTH = 8
+    }
+
+    private val secureRandom = SecureRandom()
+
+    private val usageConsumedThisProcess = java.util.Collections.synchronizedSet(mutableSetOf<Long>())
+
+    private val remoteVerifier by lazy { RemoteActivationVerifier(context) }
+
+    suspend fun verifyRemoteActivation(
+        appId: Long,
+        inputCode: String,
+        request: RemoteActivationVerifier.RemoteRequest
+    ): ActivationResult {
+        if (inputCode.isBlank()) {
+            return ActivationResult.Empty
+        }
+
+        val lockoutRemaining = getLockoutRemainingMs(appId)
+        if (lockoutRemaining > 0) {
+            return ActivationResult.Invalid(
+                Strings.tooManyAttemptsWithCountdown(formatLockoutRemaining(lockoutRemaining))
+            )
+        }
+
+        val result = remoteVerifier.verify(appId, request.copy(code = normalizeCode(inputCode)))
+        if (result is ActivationResult.Success) {
+            clearFailedAttempts(appId)
+            saveActivationStatus(appId, true)
+        } else if (result is ActivationResult.Invalid) {
+            recordFailedAttempt(appId)
+        }
+        return result
+    }
+
+    suspend fun isRemoteStartupAllowed(
+        appId: Long,
+        request: RemoteActivationVerifier.RemoteRequest
+    ): Boolean {
+        return remoteVerifier.resolveCachedStartup(appId, request)
+    }
+
+    fun buildRemoteRequest(
+        verifyUrl: String,
+        publicKeyBase64: String,
+        offlinePolicy: com.webtoapp.data.model.RemoteActivationOfflinePolicy
+    ): RemoteActivationVerifier.RemoteRequest {
+        return RemoteActivationVerifier.RemoteRequest(
+            verifyUrl = verifyUrl,
+            publicKeyBase64 = publicKeyBase64,
+            offlinePolicy = offlinePolicy,
+            code = "",
+            deviceId = DeviceIdGenerator.getDeviceId(context),
+            packageName = context.packageName
+        )
+    }
+
+    suspend fun verifyActivationCode(
+        appId: Long,
+        inputCode: String,
+        validCodes: List<String>
+    ): ActivationResult {
+        if (inputCode.isBlank()) {
+            return ActivationResult.Empty
+        }
+
+        val lockoutRemaining = getLockoutRemainingMs(appId)
+        if (lockoutRemaining > 0) {
+            AppLogger.w(TAG, "Verification blocked: app=$appId is locked out for ${formatLockoutRemaining(lockoutRemaining)}")
+            return ActivationResult.Invalid(
+                Strings.tooManyAttemptsWithCountdown(formatLockoutRemaining(lockoutRemaining))
+            )
+        }
+
+        val normalizedInput = normalizeCode(inputCode)
+
+        val parsedCodes = validCodes.map { raw ->
+            ActivationCode.fromJson(raw) ?: ActivationCode.fromLegacyString(raw)
+        }
+
+        return verifyAgainstCodes(appId, normalizedInput, parsedCodes)
+    }
+
+    suspend fun verifyActivationCodeWithObjects(
+        appId: Long,
+        inputCode: String,
+        validActivationCodes: List<ActivationCode>
+    ): ActivationResult {
+        if (inputCode.isBlank()) {
+            return ActivationResult.Empty
+        }
+
+        val lockoutRemaining = getLockoutRemainingMs(appId)
+        if (lockoutRemaining > 0) {
+            AppLogger.w(TAG, "Verification blocked: app=$appId is locked out")
+            return ActivationResult.Invalid(
+                Strings.tooManyAttemptsWithCountdown(formatLockoutRemaining(lockoutRemaining))
+            )
+        }
+
+        val normalizedInput = normalizeCode(inputCode)
+        return verifyAgainstCodes(appId, normalizedInput, validActivationCodes)
+    }
+
+    private suspend fun verifyAgainstCodes(
+        appId: Long,
+        normalizedInput: String,
+        validCodes: List<ActivationCode>
+    ): ActivationResult {
+
+        val matchedCode = validCodes.firstOrNull { code ->
+            val normalizedCode = normalizeCode(code.code)
+            constantTimeEquals(normalizedInput, normalizedCode) ||
+                constantTimeEquals(sha256Hash(normalizedInput), normalizedCode)
+        }
+
+        if (matchedCode == null) {
+            val newLockout = recordFailedAttempt(appId)
+            AppLogger.w(TAG, "Verification failed: app=$appId, lockout=${newLockout}ms")
+            return if (newLockout > 0) {
+                ActivationResult.Invalid(
+                    Strings.tooManyAttemptsWithCountdown(formatLockoutRemaining(newLockout))
+                )
+            } else {
+                ActivationResult.Invalid(Strings.invalidActivationCode)
+            }
+        }
+
+        val currentStatus = getActivationStatus(appId)
+        if (currentStatus.isActivated && currentStatus.isValid) {
+            AppLogger.i(TAG, "Already activated: app=$appId")
+            return ActivationResult.AlreadyActivated
+        }
+
+        val deviceId = DeviceIdGenerator.getDeviceId(context)
+        val validationResult = validateActivationCode(matchedCode, appId, deviceId)
+
+        if (validationResult is ActivationResult.Success) {
+            clearFailedAttempts(appId)
+            saveActivationStatus(appId, matchedCode, deviceId)
+            AppLogger.i(TAG, "Activation successful: app=$appId, type=${matchedCode.type}")
+        } else {
+            AppLogger.w(TAG, "Activation rejected: app=$appId, result=$validationResult")
+        }
+
+        return validationResult
+    }
+
+    private suspend fun validateActivationCode(
+        code: ActivationCode,
+        appId: Long,
+        deviceId: String
+    ): ActivationResult {
+        val currentStatus = getActivationStatus(appId)
+
+        if (currentStatus.isActivated) {
+            if (currentStatus.isExpired) {
+                return ActivationResult.Expired
+            }
+            if (currentStatus.isUsageExceeded) {
+                return ActivationResult.UsageExceeded
+            }
+            if (code.type == ActivationCodeType.DEVICE_BOUND &&
+                currentStatus.deviceId != null &&
+                currentStatus.deviceId != deviceId
+            ) {
+                return ActivationResult.DeviceMismatch
+            }
+        }
+
+        if (code.type == ActivationCodeType.DEVICE_BOUND && code.allowDeviceBinding) {
+            if (currentStatus.deviceId != null && currentStatus.deviceId != deviceId) {
+                return ActivationResult.DeviceMismatch
+            }
+        }
+
+        if (code.type == ActivationCodeType.TIME_LIMITED ||
+            code.type == ActivationCodeType.COMBINED
+        ) {
+            if (code.timeLimitMs == null || code.timeLimitMs <= 0) {
+                return ActivationResult.Invalid(Strings.invalidTimeLimitConfig)
+            }
+        }
+
+        if (code.type == ActivationCodeType.USAGE_LIMITED ||
+            code.type == ActivationCodeType.COMBINED
+        ) {
+            if (code.usageLimit == null || code.usageLimit <= 0) {
+                return ActivationResult.Invalid(Strings.invalidUsageLimitConfig)
+            }
+        }
+
+        return ActivationResult.Success
+    }
+
+    fun isActivated(appId: Long): Flow<Boolean> {
+        return context.activationDataStore.data.map { preferences ->
+            val activated = preferences[booleanPreferencesKey("activated_$appId")] ?: false
+            if (activated) {
+                val status = getActivationStatusSync(appId, preferences)
+                status.isValid
+            } else {
+                false
+            }
+        }
+    }
+
+    suspend fun resolveStartupActivation(appId: Long): Boolean {
+        val status = getActivationStatus(appId)
+        if (!status.isActivated || !status.isValid) {
+            return false
+        }
+        if (status.usageLimit != null && usageConsumedThisProcess.add(appId)) {
+            incrementUsageCount(appId)
+            AppLogger.i(TAG, "Usage consumed for launch: app=$appId, used=${status.usageCount + 1}/${status.usageLimit}")
+        }
+        return true
+    }
+
+    suspend fun getActivationStatus(appId: Long): ActivationStatus {
+        return context.activationDataStore.data.first().let { preferences ->
+            getActivationStatusSync(appId, preferences)
+        }
+    }
+
+    private fun getActivationStatusSync(appId: Long, preferences: Preferences): ActivationStatus {
+        val isActivated = preferences[booleanPreferencesKey("activated_$appId")] ?: false
+        val activatedTime = preferences[longPreferencesKey("activated_time_$appId")]
+        val expireTime = preferences[longPreferencesKey("expire_time_$appId")]
+        val usageCount = preferences[intPreferencesKey("usage_count_$appId")] ?: 0
+        val usageLimit = preferences[intPreferencesKey("usage_limit_$appId")]
+        val deviceId = preferences[stringPreferencesKey("device_id_$appId")]
+        val codeTypeStr = preferences[stringPreferencesKey("code_type_$appId")]
+        val codeType = codeTypeStr?.let {
+            try {
+                ActivationCodeType.valueOf(it)
+            } catch (e: Exception) {
+                null
+            }
+        }
+
+        return ActivationStatus(
+            isActivated = isActivated,
+            activatedTime = activatedTime,
+            expireTime = expireTime,
+            usageCount = usageCount,
+            usageLimit = usageLimit,
+            deviceId = deviceId,
+            codeType = codeType
+        )
+    }
+
+    suspend fun saveActivationStatus(appId: Long, code: ActivationCode, deviceId: String) {
+        val currentTime = System.currentTimeMillis()
+        val expireTime = when (code.type) {
+            ActivationCodeType.TIME_LIMITED, ActivationCodeType.COMBINED -> {
+                code.timeLimitMs?.let { currentTime + it }
+            }
+            else -> null
+        }
+
+        context.activationDataStore.edit { preferences ->
+            preferences[booleanPreferencesKey("activated_$appId")] = true
+            preferences[longPreferencesKey("activated_time_$appId")] = currentTime
+            expireTime?.let {
+                preferences[longPreferencesKey("expire_time_$appId")] = it
+            }
+            code.usageLimit?.let {
+                preferences[intPreferencesKey("usage_limit_$appId")] = it
+                preferences[intPreferencesKey("usage_count_$appId")] = 0
+            }
+            if (code.type == ActivationCodeType.DEVICE_BOUND && code.allowDeviceBinding) {
+                preferences[stringPreferencesKey("device_id_$appId")] = deviceId
+            }
+            preferences[stringPreferencesKey("code_type_$appId")] = code.type.name
+        }
+        AppLogger.i(TAG, "Activation status saved: app=$appId, type=${code.type}")
+    }
+
+    suspend fun saveActivationStatus(appId: Long, activated: Boolean) {
+        context.activationDataStore.edit { preferences ->
+            preferences[booleanPreferencesKey("activated_$appId")] = activated
+            if (activated) {
+                preferences[longPreferencesKey("activated_time_$appId")] =
+                    System.currentTimeMillis()
+            }
+        }
+    }
+
+    suspend fun incrementUsageCount(appId: Long) {
+        context.activationDataStore.edit { preferences ->
+            val currentCount = preferences[intPreferencesKey("usage_count_$appId")] ?: 0
+            preferences[intPreferencesKey("usage_count_$appId")] = currentCount + 1
+        }
+    }
+
+    suspend fun resetActivation(appId: Long) {
+        usageConsumedThisProcess.remove(appId)
+        context.activationDataStore.edit { preferences ->
+            preferences.remove(booleanPreferencesKey("activated_$appId"))
+            preferences.remove(longPreferencesKey("activated_time_$appId"))
+            preferences.remove(longPreferencesKey("expire_time_$appId"))
+            preferences.remove(intPreferencesKey("usage_count_$appId"))
+            preferences.remove(intPreferencesKey("usage_limit_$appId"))
+            preferences.remove(stringPreferencesKey("device_id_$appId"))
+            preferences.remove(stringPreferencesKey("code_type_$appId"))
+            preferences.remove(intPreferencesKey("failed_attempts_$appId"))
+            preferences.remove(longPreferencesKey("lockout_until_$appId"))
+        }
+        AppLogger.i(TAG, "Activation reset: app=$appId")
+    }
+
+    fun generateActivationCode(
+        length: Int = DEFAULT_CODE_LENGTH,
+        @Suppress("UNUSED_PARAMETER") seed: String = ""
+    ): String {
+        val safeLen = length.coerceIn(MIN_CODE_LENGTH, MAX_CODE_LENGTH)
+        val chars = CharArray(safeLen) { CODE_CHARS[secureRandom.nextInt(CODE_CHARS.length)] }
+        return String(chars)
+    }
+
+    fun generateActivationCode(
+        type: ActivationCodeType = ActivationCodeType.PERMANENT,
+        timeLimitMs: Long? = null,
+        usageLimit: Int? = null,
+        note: String? = null,
+        length: Int = DEFAULT_CODE_LENGTH
+    ): ActivationCode {
+        val code = generateActivationCode(length)
+        return ActivationCode(
+            code = code,
+            type = type,
+            timeLimitMs = timeLimitMs,
+            usageLimit = usageLimit,
+            allowDeviceBinding = type == ActivationCodeType.DEVICE_BOUND,
+            note = note
+        )
+    }
+
+    fun generateActivationCodes(count: Int, length: Int = DEFAULT_CODE_LENGTH): List<String> {
+        return (1..count).map { generateActivationCode(length) }
+    }
+
+    fun generateActivationCodes(
+        count: Int,
+        type: ActivationCodeType = ActivationCodeType.PERMANENT,
+        timeLimitMs: Long? = null,
+        usageLimit: Int? = null,
+        length: Int = DEFAULT_CODE_LENGTH
+    ): List<ActivationCode> {
+        return (1..count).map { index ->
+            generateActivationCode(
+                type = type,
+                timeLimitMs = timeLimitMs,
+                usageLimit = usageLimit,
+                note = "${Strings.batchGeneratedNote} #$index",
+                length = length
+            )
+        }
+    }
+
+    private fun normalizeCode(code: String): String {
+        return code.replace("-", "")
+            .replace(" ", "")
+            .uppercase()
+            .trim()
+    }
+
+    private fun sha256Hash(input: String): String {
+        val bytes = MessageDigest.getInstance("SHA-256")
+            .digest((input + SALT).toByteArray())
+        return bytes.joinToString("") { "%02x".format(it) }
+    }
+
+    private fun constantTimeEquals(a: String, b: String): Boolean {
+        if (a.length != b.length) return false
+        var result = 0
+        for (i in a.indices) {
+            result = result or (a[i].code xor b[i].code)
+        }
+        return result == 0
+    }
+
+    private suspend fun getLockoutRemainingMs(appId: Long): Long {
+        val now = System.currentTimeMillis()
+        val lockoutUntil = context.activationDataStore.data.first()[longPreferencesKey("lockout_until_$appId")] ?: 0L
+        return (lockoutUntil - now).coerceAtLeast(0L)
+    }
+
+    private suspend fun recordFailedAttempt(appId: Long): Long {
+        val attemptsKey = intPreferencesKey("failed_attempts_$appId")
+        val lockoutKey = longPreferencesKey("lockout_until_$appId")
+
+        context.activationDataStore.edit { preferences ->
+            val now = System.currentTimeMillis()
+            val currentLockoutUntil = preferences[lockoutKey] ?: 0L
+
+            if (currentLockoutUntil > now) {
+                return@edit
+            }
+
+            val failedAttempts = (preferences[attemptsKey] ?: 0) + 1
+            if (failedAttempts >= MAX_FAILED_ATTEMPTS) {
+                val lockoutUntil = now + LOCKOUT_DURATION_MS
+                preferences[lockoutKey] = lockoutUntil
+                preferences[attemptsKey] = 0
+                AppLogger.w(TAG, "Account locked out: app=$appId, until=${lockoutUntil}")
+            } else {
+                preferences[attemptsKey] = failedAttempts
+                preferences.remove(lockoutKey)
+            }
+        }
+
+        return getLockoutRemainingMs(appId)
+    }
+
+    private suspend fun clearFailedAttempts(appId: Long) {
+        val attemptsKey = intPreferencesKey("failed_attempts_$appId")
+        val lockoutKey = longPreferencesKey("lockout_until_$appId")
+        context.activationDataStore.edit { preferences ->
+            preferences.remove(attemptsKey)
+            preferences.remove(lockoutKey)
+        }
+    }
+
+    private fun formatLockoutRemaining(remainingMs: Long): String {
+        val totalSeconds = ((remainingMs + 999) / 1000).coerceAtLeast(1)
+        val minutes = totalSeconds / 60
+        val seconds = totalSeconds % 60
+        return if (minutes > 0) {
+            "${minutes}m ${seconds}s"
+        } else {
+            "${seconds}s"
+        }
+    }
+}
+
+sealed class ActivationResult {
+    data object Success : ActivationResult()
+    data class Invalid(val message: String = "") : ActivationResult()
+    data object Empty : ActivationResult()
+    data object AlreadyActivated : ActivationResult()
+    data object DeviceMismatch : ActivationResult()
+    data object Expired : ActivationResult()
+    data object UsageExceeded : ActivationResult()
+}
