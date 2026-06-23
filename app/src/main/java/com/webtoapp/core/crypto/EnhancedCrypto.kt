@@ -7,6 +7,7 @@ import com.webtoapp.core.logging.AppLogger
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.io.OutputStream
+import javax.crypto.CipherInputStream
 import java.security.KeyStore
 import java.security.SecureRandom
 import javax.crypto.Cipher
@@ -97,10 +98,7 @@ object EnhancedCrypto {
                 isCleared = true
             }
         }
-
-        protected fun finalize() {
-            close()
-        }
+        // Callers are responsible for calling close() explicitly, preferably via a use{} block.
     }
 
     fun getOrCreateMasterKey(context: Context): SecretKey? {
@@ -214,7 +212,8 @@ object EnhancedCrypto {
         output: OutputStream,
         key: SecretKey,
         associatedData: ByteArray? = null,
-        onProgress: ((Long, Long) -> Unit)? = null
+        onProgress: ((Long, Long) -> Unit)? = null,
+        totalSize: Long = -1L
     ): Long {
         val iv = ByteArray(IV_SIZE).also { secureRandom.nextBytes(it) }
 
@@ -229,8 +228,6 @@ object EnhancedCrypto {
         val buffer = ByteArray(STREAM_CHUNK_SIZE)
         var totalRead = 0L
         var bytesRead: Int
-
-        val totalSize = input.available().toLong()
 
         while (input.read(buffer).also { bytesRead = it } != -1) {
             val encrypted = cipher.update(buffer, 0, bytesRead)
@@ -265,18 +262,19 @@ object EnhancedCrypto {
 
         associatedData?.let { cipher.updateAAD(it) }
 
-        val encryptedData = input.readBytes()
-        val maxDecryptSize = 50L * 1024 * 1024
-        require(encryptedData.size <= maxDecryptSize) {
-            "Encrypted data too large for in-memory decryption: ${encryptedData.size} bytes. " +
-            "Consider using chunked encryption for files > ${maxDecryptSize / 1024 / 1024}MB."
+        val buffer = ByteArray(STREAM_CHUNK_SIZE)
+        var totalWritten = 0L
+        var bytesRead: Int
+
+        CipherInputStream(input, cipher).use { cipherStream ->
+            while (cipherStream.read(buffer).also { bytesRead = it } != -1) {
+                output.write(buffer, 0, bytesRead)
+                totalWritten += bytesRead
+                onProgress?.invoke(totalWritten, -1L)
+            }
         }
-        val decrypted = cipher.doFinal(encryptedData)
 
-        output.write(decrypted)
-        onProgress?.invoke(decrypted.size.toLong(), decrypted.size.toLong())
-
-        return decrypted.size.toLong()
+        return totalWritten
     }
 
     fun hmac(key: ByteArray, data: ByteArray): ByteArray {

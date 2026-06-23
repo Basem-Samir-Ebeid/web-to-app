@@ -2,7 +2,11 @@ package com.webtoapp.core.activation
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
 import android.provider.Settings
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
 import com.webtoapp.core.logging.AppLogger
 import java.security.MessageDigest
 import java.util.UUID
@@ -16,8 +20,64 @@ object DeviceIdGenerator {
     private const val KEY_DEVICE_ID = "device_id"
     private const val KEY_DEVICE_ID_HMAC = "device_id_hmac"
     private const val KEY_DEVICE_ID_PACKAGE = "device_id_package"
-    private const val HMAC_SECRET = "WTA_DeviceId_Integrity_2024"
     private const val LEGACY_PACKAGE_MARKER = "<legacy-no-package>"
+    private const val SECURE_PREFS_NAME = "device_id_secure_prefs"
+    private const val KEY_FALLBACK_SECRET = "hmac_fallback_secret"
+
+    private fun getHmacKeyMaterial(context: Context): ByteArray {
+        return try {
+            val sigBytes = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val info = context.packageManager.getPackageInfo(
+                    context.packageName,
+                    PackageManager.GET_SIGNING_CERTIFICATES
+                )
+                info.signingInfo?.apkContentsSigners?.firstOrNull()?.toByteArray()
+            } else {
+                @Suppress("DEPRECATION")
+                val info = context.packageManager.getPackageInfo(
+                    context.packageName,
+                    PackageManager.GET_SIGNATURES
+                )
+                @Suppress("DEPRECATION")
+                info.signatures?.firstOrNull()?.toByteArray()
+            }
+            if (sigBytes != null && sigBytes.isNotEmpty()) {
+                MessageDigest.getInstance("SHA-256").digest(sigBytes)
+            } else {
+                null
+            }
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "Failed to read signing certificate; using fallback HMAC key", e)
+            null
+        } ?: getFallbackKeyMaterial(context)
+    }
+
+    private fun getFallbackKeyMaterial(context: Context): ByteArray {
+        return try {
+            val masterKey = MasterKey.Builder(context)
+                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+                .build()
+            val securePrefs = EncryptedSharedPreferences.create(
+                context,
+                SECURE_PREFS_NAME,
+                masterKey,
+                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+            )
+            val existing = securePrefs.getString(KEY_FALLBACK_SECRET, null)
+            val secret = if (!existing.isNullOrBlank()) {
+                existing
+            } else {
+                val generated = UUID.randomUUID().toString() + UUID.randomUUID().toString()
+                securePrefs.edit().putString(KEY_FALLBACK_SECRET, generated).apply()
+                generated
+            }
+            secret.toByteArray()
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "EncryptedSharedPreferences unavailable; HMAC key quality degraded", e)
+            "WTA_DeviceId_Fallback".toByteArray()
+        }
+    }
 
     @SuppressLint("HardwareIds")
     fun getDeviceId(context: Context): String {
@@ -35,12 +95,13 @@ object DeviceIdGenerator {
         val savedPackage = prefs.getString(KEY_DEVICE_ID_PACKAGE, null)
 
         if (!savedId.isNullOrBlank() && !savedHmac.isNullOrBlank()) {
+            val keyMaterial = getHmacKeyMaterial(context)
             val expectedHmac = if (savedPackage == null) {
-                computeLegacyHmac(savedId)
+                computeLegacyHmac(savedId, keyMaterial)
             } else if (savedPackage == LEGACY_PACKAGE_MARKER) {
-                computeLegacyHmac(savedId)
+                computeLegacyHmac(savedId, keyMaterial)
             } else {
-                computeHmac(savedId, savedPackage)
+                computeHmac(savedId, savedPackage, keyMaterial)
             }
             if (constantTimeEquals(savedHmac, expectedHmac)) {
 
@@ -68,7 +129,7 @@ object DeviceIdGenerator {
             computeDeviceId(UUID.randomUUID().toString().replace("-", ""), safePackage)
         }
 
-        val hmac = computeHmac(deviceId, safePackage)
+        val hmac = computeHmac(deviceId, safePackage, getHmacKeyMaterial(context))
         prefs.edit()
             .putString(KEY_DEVICE_ID, deviceId)
             .putString(KEY_DEVICE_ID_HMAC, hmac)
@@ -94,18 +155,18 @@ object DeviceIdGenerator {
         return bytes.joinToString("") { "%02x".format(it) }.take(32)
     }
 
-    private fun computeHmac(data: String, packageName: String): String {
+    private fun computeHmac(data: String, packageName: String, keyMaterial: ByteArray): String {
         val mac = Mac.getInstance("HmacSHA256")
-        val keySpec = SecretKeySpec(HMAC_SECRET.toByteArray(), "HmacSHA256")
+        val keySpec = SecretKeySpec(keyMaterial, "HmacSHA256")
         mac.init(keySpec)
         val payload = "$data|$packageName".toByteArray()
         val hmacBytes = mac.doFinal(payload)
         return hmacBytes.joinToString("") { "%02x".format(it) }
     }
 
-    private fun computeLegacyHmac(data: String): String {
+    private fun computeLegacyHmac(data: String, keyMaterial: ByteArray): String {
         val mac = Mac.getInstance("HmacSHA256")
-        val keySpec = SecretKeySpec(HMAC_SECRET.toByteArray(), "HmacSHA256")
+        val keySpec = SecretKeySpec(keyMaterial, "HmacSHA256")
         mac.init(keySpec)
         val hmacBytes = mac.doFinal(data.toByteArray())
         return hmacBytes.joinToString("") { "%02x".format(it) }

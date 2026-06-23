@@ -1,5 +1,6 @@
 package com.webtoapp.ui.screens
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.webtoapp.core.logging.AppLogger
 import com.webtoapp.ui.design.WtaSwitch
 import com.webtoapp.ui.components.PremiumButton
 
@@ -581,7 +582,7 @@ fun CreateNodeJsAppScreen(
                                                     }
 
                                                     buildMode = NodeJsBuildMode.API_BACKEND
-                                                } catch (e: Exception) { android.util.Log.w("CreateNodeJsApp", "Failed to parse package.json", e) }
+                                                } catch (e: Exception) { AppLogger.w("CreateNodeJsApp", "Failed to parse package.json", e) }
                                             }
 
                                             appName = sample.name

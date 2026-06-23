@@ -1,0 +1,149 @@
+Please apply the following fixes to the web-to-app Android project:
+
+---
+
+## FIX 1 — targetSdk (CRITICAL)
+**File:** `app/build.gradle.kts`
+
+Change:
+```
+targetSdk = 28
+```
+To:
+```
+targetSdk = 35
+```
+
+---
+
+## FIX 2 — Remove hardcoded HMAC secret (CRITICAL)
+**File:** `app/src/main/java/com/webtoapp/core/activation/DeviceIdGenerator.kt`
+
+Replace the hardcoded constant:
+```kotlin
+private const val HMAC_SECRET = "WTA_DeviceId_Integrity_2024"
+```
+With a method that generates the secret from the app's own signing signature at runtime using PackageManager, so it is never stored as a plain string in the source code. Use the first signing certificate's SHA-256 bytes as the HMAC key material. Fall back to a UUID stored in EncryptedSharedPreferences if the signature is unavailable.
+
+---
+
+## FIX 3 — Fix decryptStream to use streaming instead of loading full file into RAM (CRITICAL)
+**File:** `app/src/main/java/com/webtoapp/core/crypto/EnhancedCrypto.kt`
+
+The current `decryptStream` function calls `input.readBytes()` which loads the entire encrypted file into memory. Rewrite it to use `CipherInputStream` for true streaming decryption, matching the approach already used in `encryptStream`. Remove the `maxDecryptSize` check since streaming no longer has the memory constraint.
+
+---
+
+## FIX 4 — Restrict cleartext traffic in production (CRITICAL)
+**File:** `app/src/main/res/xml/network_security_config.xml`
+
+Change the base-config to deny cleartext traffic by default. Only allow cleartext for localhost and 127.0.0.1 (which are already in the domain-config). The file should become:
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </domain-config>
+</network-security-config>
+```
+Note: the debug config at `app/src/debug/res/xml/network_security_config.xml` can remain unchanged.
+
+---
+
+## FIX 5 — Fix unreliable progress reporting in encryptStream (WARNING)
+**File:** `app/src/main/java/com/webtoapp/core/crypto/EnhancedCrypto.kt`
+
+In `encryptStream`, the line:
+```kotlin
+val totalSize = input.available().toLong()
+```
+`available()` does not return the full stream size reliably. Add an optional `totalSize: Long = -1L` parameter to the function signature and use it for progress reporting. If `-1`, pass `-1` to `onProgress` as the total to indicate unknown size.
+
+---
+
+## FIX 6 — Replace finalize() with Cleaner or explicit close() (WARNING)
+**File:** `app/src/main/java/com/webtoapp/core/crypto/EnhancedCrypto.kt` and `app/src/main/java/com/webtoapp/core/crypto/SecureMemory.kt`
+
+Remove all `protected fun finalize()` overrides. They are deprecated since Java 9 and not guaranteed to be called. The classes already implement `AutoCloseable` / `Closeable`, so callers should use `use {}` blocks. Add a `@Suppress("ObjectFinalize")` comment where needed and document that callers are responsible for calling `close()`.
+
+---
+
+## FIX 7 — Make retryCountMap thread-safe (WARNING)
+**File:** `app/src/main/java/com/webtoapp/util/DownloadHelper.kt`
+
+Change:
+```kotlin
+private val retryCountMap = mutableMapOf<String, Int>()
+```
+To:
+```kotlin
+private val retryCountMap = java.util.concurrent.ConcurrentHashMap<String, Int>()
+```
+
+---
+
+## FIX 8 — Add a reasonable activation cache grace period (WARNING)
+**File:** `app/src/main/java/com/webtoapp/core/activation/RemoteActivationVerifier.kt`
+
+Change:
+```kotlin
+private const val CACHE_GRACE_MS = 0L
+```
+To:
+```kotlin
+private const val CACHE_GRACE_MS = 5 * 60 * 1000L // 5 minutes
+```
+
+---
+
+## FIX 9 — Fix GitHub Actions checkout version (WARNING)
+**File:** `.github/workflows/android-ci.yml` and `.github/workflows/modules-publish.yml` and `.github/workflows/modules-check.yml`
+
+In all workflow files, replace every occurrence of:
+```
+actions/checkout@v6
+```
+With:
+```
+actions/checkout@v4
+```
+`v6` does not exist and will cause CI failures.
+
+---
+
+## FIX 10 — Replace direct android.util.Log calls with AppLogger (WARNING)
+**Files:** `app/src/main/java/com/webtoapp/ui/screens/CreateAppUserScripts.kt`, `CreatePythonAppScreen.kt`, `CreateNodeJsAppScreen.kt`, `CreateGoAppScreen.kt`
+
+Replace all direct calls like:
+```kotlin
+android.util.Log.w("Tag", "message", e)
+```
+With the internal logger:
+```kotlin
+AppLogger.w("Tag", "message", e)
+```
+Import `com.webtoapp.core.logging.AppLogger` where missing.
+
+---
+
+## FIX 11 — Remove redundant database index on web_apps table (IMPROVEMENT)
+**File:** `app/src/main/java/com/webtoapp/data/model/WebApp.kt`
+
+In the `@Entity` annotation, remove this index:
+```kotlin
+Index(value = ["appType", "url"]),
+```
+It is already covered by the composite index `Index(value = ["appType", "iconPath", "url"])`. Removing it reduces DB size and speeds up writes. Remember to increment the Room database version and add a migration.
+
+---
+
+Please apply all 11 fixes above. Do not change any other logic or functionality outside of what is described.

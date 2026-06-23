@@ -1,5 +1,6 @@
 package com.webtoapp.ui.screens
 
+import com.webtoapp.core.logging.AppLogger
 import com.webtoapp.ui.components.PremiumButton
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -226,7 +227,7 @@ fun CreateGoAppScreen(
                                     }
                                 }
                                 goDeps = deps
-                            } catch (e: Exception) { android.util.Log.w("CreateGoApp", "Failed to parse go.mod", e) }
+                            } catch (e: Exception) { AppLogger.w("CreateGoApp", "Failed to parse go.mod", e) }
                         }
 
                         creationPhase = Strings.goProjectReady

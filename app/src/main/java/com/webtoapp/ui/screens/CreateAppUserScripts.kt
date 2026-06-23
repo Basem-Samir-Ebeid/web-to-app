@@ -1,6 +1,7 @@
 package com.webtoapp.ui.screens
 
 import android.net.Uri
+import com.webtoapp.core.logging.AppLogger
 import com.webtoapp.ui.design.WtaSwitch
 import com.webtoapp.ui.design.WtaSettingCard
 import com.webtoapp.ui.design.WtaSettingRow
@@ -171,7 +172,7 @@ fun UserScriptEditorDialog(
                         if (fileName.isNotBlank()) name = fileName
                     }
                 }
-            } catch (e: Exception) { android.util.Log.w("CreateApp", "Failed to read script file", e) }
+            } catch (e: Exception) { AppLogger.w("CreateApp", "Failed to read script file", e) }
         }
     }
 

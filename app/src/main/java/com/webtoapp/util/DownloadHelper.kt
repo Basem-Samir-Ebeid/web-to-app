@@ -29,7 +29,7 @@ object DownloadHelper {
     private val QUOTED_FILENAME_REGEX = Regex("""filename\s*=\s*"([^"]+)""""", RegexOption.IGNORE_CASE)
     private val UNQUOTED_FILENAME_REGEX = Regex("""filename\s*=\s*([^;\s]+)""", RegexOption.IGNORE_CASE)
 
-    private val retryCountMap = mutableMapOf<String, Int>()
+    private val retryCountMap = java.util.concurrent.ConcurrentHashMap<String, Int>()
 
     fun parseFileName(url: String, contentDisposition: String?, mimeType: String?): String {
         var fileName: String? = null

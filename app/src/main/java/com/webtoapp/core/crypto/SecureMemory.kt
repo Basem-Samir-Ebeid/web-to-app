@@ -156,10 +156,7 @@ class SecureBytes private constructor(
             isCleared = true
         }
     }
-
-    protected fun finalize() {
-        close()
-    }
+    // Callers are responsible for calling close() explicitly, preferably via a use{} block.
 }
 
 class SecureString private constructor(
@@ -202,10 +199,7 @@ class SecureString private constructor(
             isCleared = true
         }
     }
-
-    protected fun finalize() {
-        close()
-    }
+    // Callers are responsible for calling close() explicitly, preferably via a use{} block.
 }
 
 class SensitiveData<T>(

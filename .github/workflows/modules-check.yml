@@ -39,7 +39,7 @@ jobs:
 
     steps:
       - name: Download code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Use system Python 3
         # Ubuntu runners ship a recent Python 3 — no setup-python step needed.

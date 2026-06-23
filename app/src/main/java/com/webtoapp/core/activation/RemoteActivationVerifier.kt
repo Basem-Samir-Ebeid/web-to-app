@@ -26,7 +26,7 @@ class RemoteActivationVerifier(private val context: Context) {
     companion object {
         private const val TAG = "RemoteActivation"
         private const val NONCE_BYTES = 24
-        private const val CACHE_GRACE_MS = 0L
+        private const val CACHE_GRACE_MS = 5 * 60 * 1000L // 5 minutes
     }
 
     data class RemoteRequest(

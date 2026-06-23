@@ -56,7 +56,7 @@ android {
         applicationId = "com.webtoapp"
         minSdk = 23
 
-        targetSdk = 28
+        targetSdk = 35
         versionCode = 43
         versionName = "2.1.0"
         buildConfigField("boolean", "SHELL_RUNTIME_ONLY", "false")

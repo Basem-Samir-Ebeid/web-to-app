@@ -1,6 +1,7 @@
 package com.webtoapp.ui.screens
 
 import android.net.Uri
+import com.webtoapp.core.logging.AppLogger
 import com.webtoapp.ui.components.PremiumButton
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -193,7 +194,7 @@ fun CreatePythonAppScreen(
                                         } else ""
                                         name to version
                                     }
-                            } catch (e: Exception) { android.util.Log.w("CreatePythonApp", "Failed to parse requirements.txt", e) }
+                            } catch (e: Exception) { AppLogger.w("CreatePythonApp", "Failed to parse requirements.txt", e) }
                         } else if (pipfileFile.exists()) {
                             requirementsSource = "Pipfile"
                             try {
@@ -208,7 +209,7 @@ fun CreatePythonAppScreen(
                                         val value = line.substringAfter("=").trim().removeSurrounding("\"")
                                         key to value
                                     }
-                            } catch (e: Exception) { android.util.Log.w("CreatePythonApp", "Failed to parse Pipfile", e) }
+                            } catch (e: Exception) { AppLogger.w("CreatePythonApp", "Failed to parse Pipfile", e) }
                         }
 
                         if (pyprojectFile.exists()) {
@@ -236,7 +237,7 @@ fun CreatePythonAppScreen(
                                             }
                                     }
                                 }
-                            } catch (e: Exception) { android.util.Log.w("CreatePythonApp", "Failed to parse pyproject.toml", e) }
+                            } catch (e: Exception) { AppLogger.w("CreatePythonApp", "Failed to parse pyproject.toml", e) }
                         }
 
                         val setupPy = File(copiedDir, "setup.py")
@@ -245,7 +246,7 @@ fun CreatePythonAppScreen(
                                 val content = setupPy.readText()
                                 val nameMatch = Regex("""name\s*=\s*['"]([^'"]+)['"]""").find(content)
                                 nameMatch?.groupValues?.get(1)?.let { appName = it }
-                            } catch (e: Exception) { android.util.Log.w("CreatePythonApp", "Failed to parse setup.py", e) }
+                            } catch (e: Exception) { AppLogger.w("CreatePythonApp", "Failed to parse setup.py", e) }
                         }
 
                         if (framework == "django") {
@@ -259,7 +260,7 @@ fun CreatePythonAppScreen(
                                         djangoSettingsModule = it
                                         entryModule = "$it.wsgi:application"
                                     }
-                                } catch (e: Exception) { android.util.Log.w("CreatePythonApp", "Failed to parse manage.py", e) }
+                                } catch (e: Exception) { AppLogger.w("CreatePythonApp", "Failed to parse manage.py", e) }
                             }
 
                             copiedDir.walk().maxDepth(2).filter { it.name == "wsgi.py" }.firstOrNull()?.let {

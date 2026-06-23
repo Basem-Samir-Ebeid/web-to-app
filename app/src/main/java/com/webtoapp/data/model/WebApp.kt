@@ -29,7 +29,6 @@ enum class AppType {
         Index(value = ["updatedAt"]),
         Index(value = ["categoryId"]),
         Index(value = ["isActivated"]),
-        Index(value = ["appType", "url"]),
         Index(value = ["appType", "iconPath", "url"])
     ]
 )
