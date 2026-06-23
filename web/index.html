@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebToApp</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f1117;
+      color: #e2e8f0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 2rem;
+    }
+    .card {
+      background: #1a1f2e;
+      border: 1px solid #2d3748;
+      border-radius: 16px;
+      padding: 3rem 2.5rem;
+      max-width: 700px;
+      width: 100%;
+      text-align: center;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.4);
+    }
+    .icon {
+      font-size: 4rem;
+      margin-bottom: 1rem;
+    }
+    h1 {
+      font-size: 2.5rem;
+      font-weight: 800;
+      color: #fff;
+      margin-bottom: 0.5rem;
+    }
+    .tagline {
+      font-size: 1.1rem;
+      color: #90cdf4;
+      margin-bottom: 2rem;
+      font-weight: 500;
+    }
+    .description {
+      color: #a0aec0;
+      line-height: 1.7;
+      margin-bottom: 2rem;
+      font-size: 0.97rem;
+    }
+    .notice {
+      background: #2d3748;
+      border: 1px solid #4a5568;
+      border-radius: 10px;
+      padding: 1.2rem 1.5rem;
+      margin-bottom: 2rem;
+      text-align: left;
+    }
+    .notice h3 {
+      color: #fbd38d;
+      font-size: 0.9rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 0.5rem;
+    }
+    .notice p {
+      color: #a0aec0;
+      font-size: 0.9rem;
+      line-height: 1.6;
+    }
+    .notice code {
+      background: #1a202c;
+      padding: 0.15rem 0.4rem;
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 0.85rem;
+      color: #68d391;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 1rem;
+      margin-bottom: 2rem;
+    }
+    .feature {
+      background: #2d3748;
+      border-radius: 10px;
+      padding: 1rem;
+      font-size: 0.85rem;
+      color: #cbd5e0;
+    }
+    .feature .emoji { font-size: 1.5rem; display: block; margin-bottom: 0.4rem; }
+    .badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      justify-content: center;
+    }
+    .badge {
+      background: #2b6cb0;
+      color: #bee3f8;
+      padding: 0.3rem 0.8rem;
+      border-radius: 99px;
+      font-size: 0.8rem;
+      font-weight: 600;
+    }
+    .badge.green { background: #276749; color: #9ae6b4; }
+    .badge.purple { background: #553c9a; color: #d6bcfa; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">📱</div>
+    <h1>WebToApp</h1>
+    <p class="tagline">Build Android APKs from web projects, directly on your phone.</p>
+
+    <p class="description">
+      WebToApp is an on-device APK builder for websites, HTML apps, media projects,
+      and local server runtimes. Turn a URL, a project folder, or a media library
+      into an installable Android app — packaged and signed on-device, no remote
+      build queue needed.
+    </p>
+
+    <div class="notice">
+      <h3>⚠️ Android-Only Project</h3>
+      <p>
+        This is a native <strong>Android application</strong> built with Kotlin + Jetpack Compose and Gradle.
+        It cannot run as a web app in this environment. To build it, you need
+        <strong>Android Studio</strong> and <strong>JDK 17</strong>, then run
+        <code>./gradlew assembleDebug</code> to produce an APK.
+      </p>
+    </div>
+
+    <div class="grid">
+      <div class="feature"><span class="emoji">🌐</span>Website URL → APK</div>
+      <div class="feature"><span class="emoji">⚛️</span>React / Vue / Vite</div>
+      <div class="feature"><span class="emoji">🟢</span>Node.js runtime</div>
+      <div class="feature"><span class="emoji">🐘</span>PHP / WordPress</div>
+      <div class="feature"><span class="emoji">🐍</span>Python / Django</div>
+      <div class="feature"><span class="emoji">🚀</span>Go runtime</div>
+      <div class="feature"><span class="emoji">🖼️</span>Media galleries</div>
+      <div class="feature"><span class="emoji">🔌</span>Extension modules</div>
+    </div>
+
+    <div class="badges">
+      <span class="badge">Android 6.0+</span>
+      <span class="badge green">Kotlin + Compose</span>
+      <span class="badge purple">Unlicense</span>
+      <span class="badge">Gradle 9.4.1</span>
+    </div>
+  </div>
+</body>
+</html>
