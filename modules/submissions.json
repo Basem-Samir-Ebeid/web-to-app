@@ -1,76 +1,75 @@
 {
   "schema": 1,
-  "generatedAt": "2026-06-22T15:05:30Z",
+  "generatedAt": "2026-06-23T12:41:52Z",
   "submissions": {
     "wta-auto-open-video-player": {
-      "prNumber": 134,
-      "prUrl": "https://github.com/shiaho777/web-to-app/pull/134",
-      "submittedAt": "2026-06-22T14:42:48Z",
+      "submittedAt": "2026-06-23T14:29:27+03:00",
+      "direct": true,
       "submitter": {
-        "login": "Stremiouser666",
-        "name": "Steveies",
-        "avatarUrl": "https://avatars.githubusercontent.com/u/184891406?v=4",
-        "profileUrl": "https://github.com/Stremiouser666"
+        "login": "Basem-Samir-Ebeid",
+        "name": "Basem-Samir-Ebeid",
+        "avatarUrl": "https://avatars.githubusercontent.com/u/273406812?v=4",
+        "profileUrl": "https://github.com/Basem-Samir-Ebeid"
       }
     },
     "wta-auto-scroll": {
-      "submittedAt": "2026-05-23T15:28:53+08:00",
+      "submittedAt": "2026-06-23T14:29:27+03:00",
       "direct": true,
       "submitter": {
-        "login": "shiaho777",
-        "name": "shiaho",
-        "avatarUrl": "https://avatars.githubusercontent.com/u/222622008?v=4",
-        "profileUrl": "https://github.com/shiaho777"
+        "login": "Basem-Samir-Ebeid",
+        "name": "Basem-Samir-Ebeid",
+        "avatarUrl": "https://avatars.githubusercontent.com/u/273406812?v=4",
+        "profileUrl": "https://github.com/Basem-Samir-Ebeid"
       }
     },
     "wta-hello-world": {
-      "submittedAt": "2026-05-16T01:13:57+08:00",
+      "submittedAt": "2026-06-23T14:29:27+03:00",
       "direct": true,
       "submitter": {
-        "login": "shiaho777",
-        "name": "shiaho",
-        "avatarUrl": "https://avatars.githubusercontent.com/u/222622008?v=4",
-        "profileUrl": "https://github.com/shiaho777"
+        "login": "Basem-Samir-Ebeid",
+        "name": "Basem-Samir-Ebeid",
+        "avatarUrl": "https://avatars.githubusercontent.com/u/273406812?v=4",
+        "profileUrl": "https://github.com/Basem-Samir-Ebeid"
       }
     },
     "wta-reading-mode": {
-      "submittedAt": "2026-05-23T15:28:53+08:00",
+      "submittedAt": "2026-06-23T14:29:27+03:00",
       "direct": true,
       "submitter": {
-        "login": "shiaho777",
-        "name": "shiaho",
-        "avatarUrl": "https://avatars.githubusercontent.com/u/222622008?v=4",
-        "profileUrl": "https://github.com/shiaho777"
+        "login": "Basem-Samir-Ebeid",
+        "name": "Basem-Samir-Ebeid",
+        "avatarUrl": "https://avatars.githubusercontent.com/u/273406812?v=4",
+        "profileUrl": "https://github.com/Basem-Samir-Ebeid"
       }
     },
     "wta-selection-actions": {
-      "submittedAt": "2026-06-17T21:43:16+08:00",
+      "submittedAt": "2026-06-23T14:29:27+03:00",
       "direct": true,
       "submitter": {
-        "login": "shiaho777",
-        "name": "shiaho",
-        "avatarUrl": "https://avatars.githubusercontent.com/u/222622008?v=4",
-        "profileUrl": "https://github.com/shiaho777"
+        "login": "Basem-Samir-Ebeid",
+        "name": "Basem-Samir-Ebeid",
+        "avatarUrl": "https://avatars.githubusercontent.com/u/273406812?v=4",
+        "profileUrl": "https://github.com/Basem-Samir-Ebeid"
       }
     },
     "wta-tv-dpad-cursor": {
-      "submittedAt": "2026-06-17T21:30:12+08:00",
+      "submittedAt": "2026-06-23T14:29:27+03:00",
       "direct": true,
       "submitter": {
-        "login": "shiaho777",
-        "name": "shiaho",
-        "avatarUrl": "https://avatars.githubusercontent.com/u/222622008?v=4",
-        "profileUrl": "https://github.com/shiaho777"
+        "login": "Basem-Samir-Ebeid",
+        "name": "Basem-Samir-Ebeid",
+        "avatarUrl": "https://avatars.githubusercontent.com/u/273406812?v=4",
+        "profileUrl": "https://github.com/Basem-Samir-Ebeid"
       }
     },
     "wta-web-tint": {
-      "submittedAt": "2026-06-17T21:43:16+08:00",
+      "submittedAt": "2026-06-23T14:29:27+03:00",
       "direct": true,
       "submitter": {
-        "login": "shiaho777",
-        "name": "shiaho",
-        "avatarUrl": "https://avatars.githubusercontent.com/u/222622008?v=4",
-        "profileUrl": "https://github.com/shiaho777"
+        "login": "Basem-Samir-Ebeid",
+        "name": "Basem-Samir-Ebeid",
+        "avatarUrl": "https://avatars.githubusercontent.com/u/273406812?v=4",
+        "profileUrl": "https://github.com/Basem-Samir-Ebeid"
       }
     }
   }
